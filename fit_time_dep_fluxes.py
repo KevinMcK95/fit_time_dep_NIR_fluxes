@@ -92,7 +92,8 @@ def first_guess_parameters(obs_flux_diffs,read_vars,
 
     #scale the data to get b vect estimates
     scaled_fluxes = (obs_flux_diffs/fmax_guess[:,None])
-    scaled_flux_errs = np.abs(scaled_fluxes/obs_flux_diffs*obs_flux_diff_errs)
+    scaled_flux_errs = np.abs(scaled_fluxes/np.maximum(obs_flux_diffs,min_f_val)*obs_flux_diff_errs)
+    scaled_flux_errs[scaled_flux_errs == 0] = np.inf
 
     #take weighted average to get starting b vect
     weights = np.power(scaled_flux_errs,-2)
@@ -109,8 +110,9 @@ def first_guess_parameters(obs_flux_diffs,read_vars,
 
     #now use the b vect guess to get a better f vect guess, accounting for uncertainty
     scaled_fluxes = (obs_flux_diffs/b_vect_guess)
-    scaled_flux_errs = np.sqrt(np.power(scaled_fluxes/obs_flux_diffs*obs_flux_diff_errs,2)\
+    scaled_flux_errs = np.sqrt(np.power(scaled_fluxes/np.maximum(obs_flux_diffs,min_f_val)*obs_flux_diff_errs,2)\
                                 +np.power(scaled_fluxes/b_vect_guess*b_vect_guess_errs,2))
+    scaled_flux_errs[scaled_flux_errs == 0] = np.inf
     weights = np.power(scaled_flux_errs,-2)
     # fmax_guess_errs = np.power(np.sum(weights,axis=1),-0.5)
     fmax_guess = np.maximum(np.sum(weights*scaled_fluxes,axis=1)/np.sum(weights,axis=1),min_f_val)
