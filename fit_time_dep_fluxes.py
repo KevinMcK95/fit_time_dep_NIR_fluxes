@@ -1,6 +1,36 @@
 import numpy as np
 from tqdm import tqdm
 
+def fit_fluxes_rauscher(obs_fluxes,read_errs):
+    '''
+    takes observed fluxes (shape of n_pixels,n_reads-1) 
+    and returns the optimal extracted flux (as defined by Brandt 2024)
+
+    inputs:
+        obs_fluxes: observed counts, units of electrons, shape (n_pixels,n_reads)
+        read_errs: read noise per pixel, units of electrons, shape (n_pixels)
+
+    outputs:
+        f_means: the flux means for each pixel
+        f_ivars: the flux ivars for each pixel
+        chi2s: chi-square of data-to-model comparison for each pixel
+    '''
+    
+    n_reads = obs_fluxes.shape[1]
+    n_pixels = obs_fluxes.shape[0]
+    read_vars = np.power(read_errs,2)
+
+    times = np.arange(n_reads)
+    time_sum = np.sum(times)
+    slopes = (n_reads*np.sum(times*obs_fluxes,axis=1)-np.sum(obs_fluxes,axis=1)*time_sum)\
+            /(n_reads*np.sum(np.power(times,2))- time_sum**2)
+
+    ivars = 1/(( 12*(n_reads-1.)/(n_reads*(n_reads+1.))*read_vars + \
+               6.*(n_reads**2+1)/(5.*n_reads*(n_reads+1))*(n_reads-1)*slopes) / (n_reads-1)**2)
+
+    # diffs = obs_fluxes-times[None,:]*slopes[:,None]
+    return slopes,ivars#,chi2s 
+
 def fit_fluxes_optimal(obs_fluxes,read_errs,
                        n_repeat=2,b_vect=None):
     '''
@@ -46,6 +76,7 @@ def fit_fluxes_optimal(obs_fluxes,read_errs,
         curr_data_diffs = np.maximum(curr_f_guess[:,None] * b_vect[None,:],0)
         for p_ind in range(n_pixels):
             data_V[p_ind] = np.diag(curr_data_diffs[p_ind])
+            
         comb_V_inv = np.linalg.inv(data_V + read_Vs)
     
         f_ivars = np.einsum('i,ni->n',b_vect,np.einsum('nij,j->ni',comb_V_inv,b_vect))
@@ -65,10 +96,76 @@ def fit_fluxes_optimal(obs_fluxes,read_errs,
 
     return f_means,f_ivars,chi2s
 
+def fit_fluxes_optimal_with_bcov(obs_fluxes,read_errs,b_vect,b_cov,
+                                   n_repeat=2):
+    '''
+    takes observed fluxes (shape of n_pixels,n_reads-1) 
+    and returns the optimal extracted flux, incorporating the uncertainties in vec b
+
+    inputs:
+        obs_fluxes: observed counts, units of electrons, shape (n_pixels,n_reads)
+        read_errs: read noise per pixel, units of electrons, shape (n_pixels)
+        n_repeat: number of times to update fit (should be small, like 2)
+        b_vect: factor to multiply fluxes by, length n_reads-1
+        b_cov: covariance matrix in the b_vect elements
+
+    outputs:
+        f_means: the flux means for each pixel
+        f_ivars: the flux ivars for each pixel
+        chi2s: chi-square of data-to-model comparison for each pixel
+    '''
+
+    n_reads = obs_fluxes.shape[1]
+    n_pixels = obs_fluxes.shape[0]
+    read_vars = np.power(read_errs,2)
+    if type(b_vect) is type(None):
+        b_vect = np.ones(n_reads-1)
+
+    #define read covariance matrix 
+    #(i.e. 2*read_var on diagonal, -1*read_var on one-from-diagonal)
+    read_Vs = np.zeros((n_pixels,n_reads-1,n_reads-1))
+    for p_ind in range(n_pixels):
+        read_Vs[p_ind,np.arange(n_reads-1),np.arange(n_reads-1)] = 2*read_vars[p_ind]
+        for j in range(len(read_Vs[p_ind])-1):
+            read_Vs[p_ind,j,j+1] = -read_vars[p_ind]
+            read_Vs[p_ind,j+1,j] = -read_vars[p_ind]
+
+    obs_flux_diffs = np.diff(obs_fluxes,axis=1)
+    data_V = np.zeros((n_pixels,n_reads-1,n_reads-1))
+
+    #first guess
+    curr_f_guess = np.maximum(np.nanmedian(obs_flux_diffs,axis=1),0)
+
+    for r_ind in range(n_repeat):
+    
+        #calculate the best f given the best b
+        curr_data_diffs = np.maximum(curr_f_guess[:,None] * b_vect[None,:],0)
+        for p_ind in range(n_pixels):
+            data_V[p_ind] = np.diag(curr_data_diffs[p_ind])
+            
+        comb_V_inv = np.linalg.inv(data_V + read_Vs + np.power(curr_f_guess,2)[:,None,None]*b_cov[None,:,:])
+    
+        f_ivars = np.einsum('i,ni->n',b_vect,np.einsum('nij,j->ni',comb_V_inv,b_vect))
+        f_means = (1/f_ivars) * np.einsum('i,ni->n',b_vect,np.einsum('nij,nj->ni',comb_V_inv,obs_flux_diffs))
+
+        curr_f_guess = np.maximum(f_means,0)
+
+    #calculate the best f given the best b
+    curr_model = f_means[:,None] * b_vect[None,:]
+    curr_data_diffs = np.maximum(curr_model,0)
+    for p_ind in range(n_pixels):
+        data_V[p_ind] = np.diag(curr_data_diffs[p_ind])
+    comb_V_inv = np.linalg.inv(data_V + read_Vs)
+
+    diff = obs_flux_diffs-curr_model
+    chi2s = np.einsum('ni,ni->n',diff,np.einsum('nij,nj->ni',comb_V_inv,diff))
+
+    return f_means,f_ivars,chi2s
 
 
 def first_guess_parameters(obs_flux_diffs,read_vars,
-                           min_b_val=1e-10,min_f_val=1e-10):
+                           min_b_val=1e-10,min_f_val=1e-10,
+                          random_max_b=False):
     '''
     takes observed flux differences (shape of n_pixels,n_reads-1) 
     and returns a good starting guess for the f and b vectors
@@ -78,6 +175,7 @@ def first_guess_parameters(obs_flux_diffs,read_vars,
         read_vars: read variance per pixel, units of electrons^2, shape (n_pixels)
         min_b_val: minimum value the b vector elements can take (should not be less than 0)
         min_f_val: minimum value the f vector elements can take (should not be less than 0)
+        random_max_b; boolean, default False, use any b vector element (above b_max*0.5) as reference point
 
     outputs:
         b_vect_guess: data-estimate of the b vector
@@ -100,8 +198,13 @@ def first_guess_parameters(obs_flux_diffs,read_vars,
     b_vect_guess_errs = np.power(np.sum(weights,axis=0),-0.5)
     b_vect_guess = np.maximum(np.sum(weights*scaled_fluxes,axis=0)/np.sum(weights,axis=0),min_b_val)
 
-    #scale the b vector so that maximum element is set to 1
-    max_b_ind = np.argmax(b_vect_guess)
+    if random_max_b:
+        #helps with scaling of synthetic data, but shouldn't impact real data
+        high_b_vals = np.where(b_vect_guess >= b_vect_guess.max()*0.5)[0]
+        max_b_ind = np.random.choice(high_b_vals)
+    else:
+        # #scale the b vector so that maximum element is set to 1
+        max_b_ind = np.argmax(b_vect_guess)
     b_scale = b_vect_guess[max_b_ind]
     
     b_vect_guess /= b_scale
@@ -121,10 +224,12 @@ def first_guess_parameters(obs_flux_diffs,read_vars,
 
 
 def measure_time_dep_fluxes_LINEAR(obs_fluxes,read_errs,
-                                   n_max_repeat=1000,b_vect_change_tol=1e-6,
+                                   n_max_repeat=1000,b_vect_change_tol=1e-10,
+                                   f_max_change_tol=1e-10,
                                    min_b_val=1e-10,min_f_val=1e-10,
                                    rescale=False,true_b_vect=None,
-                                   true_fluxes=None):
+                                   true_fluxes=None,random_max_b=False,
+                                   verbose=False):
     
     '''
     takes observed counts (shape of n_pixels,n_reads) 
@@ -135,10 +240,14 @@ def measure_time_dep_fluxes_LINEAR(obs_fluxes,read_errs,
         read_errs: read noise per pixel, units of electrons, shape (n_pixels)
         n_max_repeat: maximum number of times to update the f,b vectors before stopping
         b_vect_change_tol: stop updating if the b vect values have changed by less than this tolerance
+        f_max_change_tol: stop updating if the f max values have changed by less than this tolerance
         min_b_val: minimum value the b vector elements can take (should not be less than 0)
         min_f_val: minimum value the f vector elements can take (should not be less than 0)
         rescale: if True, then use the input true b vector to scale f and b vectors (which can be done arbitrarily)
         true_b_vect: if rescale is True, then use true_b_vect to rescale the output f and b vectors
+        random_max_b; boolean, default False, use any b vector element (above b_max*0.5) as reference point
+        verbose; boolean, default False, print out how long it took to converge
+
 
     outputs:
         max_b_ind: the index of the maximum element in b_vect_guess (scaled to be equal to 1)
@@ -158,7 +267,8 @@ def measure_time_dep_fluxes_LINEAR(obs_fluxes,read_errs,
 
     obs_flux_diffs = np.diff(obs_fluxes,axis=1)
     b_vect_guess,fmax_guess,max_b_ind = first_guess_parameters(obs_flux_diffs,read_vars,
-                                           min_b_val=min_b_val,min_f_val=min_f_val)
+                                           min_b_val=min_b_val,min_f_val=min_f_val,
+                                                               random_max_b=random_max_b)
 
     #define read covariance matrix 
     #(i.e. 2*read_var on diagonal, -1*read_var on one-from-diagonal)
@@ -194,6 +304,7 @@ def measure_time_dep_fluxes_LINEAR(obs_fluxes,read_errs,
     data_V = np.zeros((n_pixels,n_reads-1,n_reads-1))
 
     previous_b_vect = np.copy(curr_b_vect)
+    previous_f_max = np.copy(curr_f_max)
     f_max_means = np.copy(curr_f_max)
     b_vect_means = np.copy(curr_b_vect)
 
@@ -220,6 +331,7 @@ def measure_time_dep_fluxes_LINEAR(obs_fluxes,read_errs,
         #calculate update vector based on these derivatives
         design_dot_Vinv = np.einsum('nij,nik->njk',model_derivs,comb_V_inv)
         comb_param_Vinv = np.sum(np.einsum('nij,njk->nik',design_dot_Vinv,model_derivs),axis=0)
+
         param_changes = np.linalg.solve(comb_param_Vinv,np.sum(np.einsum('nij,nj->ni',design_dot_Vinv,curr_diffs),axis=0))
         f_max_changes = param_changes[:n_pixels]
         b_vect_changes = param_changes[n_pixels:]
@@ -236,12 +348,20 @@ def measure_time_dep_fluxes_LINEAR(obs_fluxes,read_errs,
         curr_f_max = np.maximum(f_max_means,min_f_val)
         curr_b_vect = np.maximum(b_vect_means,min_b_val)
         
-        if (np.max(np.abs(b_vect_means-previous_b_vect)) < b_vect_change_tol) and (r_ind >= 2):
+        if (np.max(np.abs(b_vect_means-previous_b_vect)) < b_vect_change_tol) \
+                and (np.max(np.abs(f_max_means-previous_f_max)) < f_max_change_tol)\
+                and (r_ind >= 2):
             #stop iterating if the b vector isn't changing much
             #typically hit this condition after <10 iterations
             break
         
         previous_b_vect[:] = b_vect_means[:]
+        previous_f_max[:] = f_max_means[:]
+        
+    if verbose:
+        print(f'Done updating f max and b vect using linearized approach. Took {r_ind+1} iterations to converge.')
+        print('b vect change summary:',np.nanpercentile(np.abs(b_vect_means-previous_b_vect),[0,16,50,84,100]))
+        print('f max change summary: ',np.nanpercentile(np.abs(f_max_means-previous_f_max),[0,16,50,84,100]))
 
     if rescale:
         '''
@@ -251,15 +371,34 @@ def measure_time_dep_fluxes_LINEAR(obs_fluxes,read_errs,
 
         
         # #measure best single mult to b to get good agreement
-        # true_b = true_b_vect[non_max_inds]
-        # comp_b = curr_b_vect[non_max_inds]
-        # mult_var = 1/np.dot(np.dot(comp_b,comb_param_Vinv[n_pixels:,n_pixels:]),comp_b)
-        # mult_mean = 1/(mult_var * np.dot(np.dot(comp_b,comb_param_Vinv[n_pixels:,n_pixels:]),true_b))
+        use_b_inds = np.where(b_vect_means[non_max_inds] > min_b_val)[0]
+        if len(use_b_inds) >= 1:
+            true_b = true_b_vect[non_max_inds][use_b_inds]
+            comp_b = b_vect_means[non_max_inds][use_b_inds]
+            comp_Vinv = comb_param_Vinv[n_pixels:,n_pixels:][use_b_inds][:,use_b_inds]
+            mult_var = 1/np.dot(np.dot(comp_b,comp_Vinv),comp_b)
+            mult_mean = 1/(mult_var * np.dot(np.dot(comp_b,comp_Vinv),true_b))
+        else:
+            true_b = true_b_vect[non_max_inds]
+            comp_b = b_vect_means[non_max_inds]
+            mult_var = 1/np.dot(np.dot(comp_b,comb_param_Vinv[n_pixels:,n_pixels:]),comp_b)
+            mult_mean = 1/(mult_var * np.dot(np.dot(comp_b,comb_param_Vinv[n_pixels:,n_pixels:]),true_b))
+        # print(mult_mean,mult_var**0.5)
 
-        # true_obs_fluxes_diffs = np.diff(true_obs_fluxes,axis=1)
-        # #measure best single mult to f to get good agreement
-        mult_var = 1/np.dot(np.dot(f_max_means,comb_param_Vinv[:n_pixels,:n_pixels]),f_max_means)
-        mult_mean = mult_var * np.dot(np.dot(f_max_means,comb_param_Vinv[:n_pixels,:n_pixels]),true_fluxes)
+        # # true_obs_fluxes_diffs = np.diff(true_obs_fluxes,axis=1)
+        # # #measure best single mult to f to get good agreement
+        # use_flux_inds = np.where(f_max_means > min_f_val)[0]
+        # if len(use_flux_inds) >= 1:
+        #     mult_var = 1/np.dot(np.dot(f_max_means[use_flux_inds],
+        #                                comb_param_Vinv[:n_pixels,:n_pixels][use_flux_inds][:,use_flux_inds]),
+        #                         f_max_means[use_flux_inds])
+        #     mult_mean = mult_var * np.dot(np.dot(f_max_means[use_flux_inds],
+        #                                          comb_param_Vinv[:n_pixels,:n_pixels][use_flux_inds][:,use_flux_inds]),
+        #                                   true_fluxes[use_flux_inds])
+        # else:
+        #     mult_var = 1/np.dot(np.dot(curr_f_max,comb_param_Vinv[:n_pixels,:n_pixels]),curr_f_max)
+        #     mult_mean = mult_var * np.dot(np.dot(curr_f_max,comb_param_Vinv[:n_pixels,:n_pixels]),true_fluxes)
+        
         # print(mult_mean,mult_var**0.5,np.nanmedian(true_fluxes/f_max_means),np.nanmean(true_fluxes/f_max_means))
         # # mult_mean = mult_var * np.dot(np.dot(f_max_means,comb_param_Vinv[:n_pixels,:n_pixels]),obs_flux_diffs[:,max_b_ind])
         # # print(mult_mean,mult_var**0.5)
@@ -315,10 +454,10 @@ def measure_time_dep_fluxes_LINEAR(obs_fluxes,read_errs,
         comb_param_means[n_pixels:] = b_vect_means[non_max_inds]
 
         comb_param_V = np.linalg.inv(comb_param_Vinv)
-        comb_param_V[:n_pixels] *= mult_mean**2
-        comb_param_V[:,:n_pixels] *= mult_mean**2
-        comb_param_V[n_pixels:] /= mult_mean**2
-        comb_param_V[:,n_pixels:] /= mult_mean**2
+        comb_param_V[:n_pixels] *= mult_mean
+        comb_param_V[:,:n_pixels] *= mult_mean
+        comb_param_V[n_pixels:] /= mult_mean
+        comb_param_V[:,n_pixels:] /= mult_mean
 
         comb_param_Vinv = np.linalg.inv(comb_param_V)
 
@@ -345,8 +484,9 @@ def measure_time_dep_fluxes_LINEAR(obs_fluxes,read_errs,
         curr_b_Vinv[non_max_inds[j],non_max_inds] = comb_param_Vinv[n_pixels+j,n_pixels:]
     curr_b_Vinv[max_b_ind] = 0
     curr_b_Vinv[:,max_b_ind] = 0
-    curr_b_V[max_b_ind] = np.inf
-    curr_b_V[:,max_b_ind] = np.inf
+    curr_b_V[max_b_ind] = 0
+    curr_b_V[:,max_b_ind] = 0
+    curr_b_V[max_b_ind,max_b_ind] = np.inf
         
     return max_b_ind,b_vect_means,curr_b_Vinv,curr_b_V,\
                 f_max_means_given_b,f_max_ivars_given_b,\
@@ -356,12 +496,14 @@ def measure_time_dep_fluxes_LINEAR(obs_fluxes,read_errs,
 
 
 def measure_time_dep_fluxes_GIBBS(obs_fluxes,read_errs,
-                                   n_samples=1000,b_vect_change_tol=1e-6,
+                                   n_samples=1000,b_vect_change_tol=1e-10,
+                                   f_max_change_tol=1e-10,
                                    min_b_val=1e-10,min_f_val=1e-10,
                                    rescale=False,true_b_vect=None,
                                    true_fluxes=None,
                                    use_linear_first_guess=False,
-                                   verbose=True,return_samples=True):
+                                   verbose=True,return_samples=True,
+                                   random_max_b=False):
     
     '''
     takes observed counts (shape of n_pixels,n_reads) 
@@ -372,6 +514,7 @@ def measure_time_dep_fluxes_GIBBS(obs_fluxes,read_errs,
         read_errs: read noise per pixel, units of electrons, shape (n_pixels)
         n_samples: number of Gibbs samples to draw from the posterior (f,b | data) distribution
         b_vect_change_tol: stop updating if the b vect values have changed by less than this tolerance
+        f_max_change_tol: stop updating if the f max values have changed by less than this tolerance
         min_b_val: minimum value the b vector elements can take (should not be less than 0)
         min_f_val: minimum value the f vector elements can take (should not be less than 0)
         rescale: if True, then use the input true b vector to scale f and b vectors (which can be done arbitrarily)
@@ -380,6 +523,7 @@ def measure_time_dep_fluxes_GIBBS(obs_fluxes,read_errs,
                                 otherwise use first_guess_parameters function
         verbose: if True, then use tqdm to print progress bad of generating Gibbs samples
         return_samples: if True, then return the Gibbs samples of (f,b | data)
+        random_max_b; boolean, default False, use any b vector element (above b_max*0.5) as reference point
         
     outputs:
         max_b_ind: the index of the maximum element in b_vect_guess (scaled to be equal to 1)
@@ -407,14 +551,17 @@ def measure_time_dep_fluxes_GIBBS(obs_fluxes,read_errs,
         f_max_means_given_b,f_max_ivars_given_b,\
         comb_param_means,comb_param_Vinv,comb_param_V = measure_time_dep_fluxes_LINEAR(obs_fluxes,read_errs,
                            b_vect_change_tol=b_vect_change_tol,
+                           f_max_change_tol=f_max_change_tol,
                            min_b_val=min_b_val,min_f_val=min_f_val,
                            rescale=rescale,true_b_vect=true_b_vect,
-                           true_fluxes=true_fluxes)
+                           true_fluxes=true_fluxes,random_max_b=random_max_b,
+                           verbose=verbose)
         b_vect_guess,fmax_guess = b_vect_means,f_max_means_given_b
     else:
         #use the simple starting guess from first_guess_parameters
         b_vect_guess,fmax_guess,max_b_ind = first_guess_parameters(obs_flux_diffs,read_vars,
-                                               min_b_val=min_b_val,min_f_val=min_f_val)
+                                               min_b_val=min_b_val,min_f_val=min_f_val,
+                                                                   random_max_b=random_max_b)
 
     #define read covariance matrix 
     #(i.e. 2*read_var on diagonal, -1*read_var on one-from-diagonal)
@@ -515,16 +662,33 @@ def measure_time_dep_fluxes_GIBBS(obs_fluxes,read_errs,
         scale the values to be as close to true b as possible for fair comparisons
         '''
         
-        # # #measure best single mult to b to get good agreement
-        # true_b = true_b_vect[non_max_inds]
-        # comp_b = b_vect_means[non_max_inds]
-        # mult_var = 1/np.dot(np.dot(comp_b,comb_param_Vinv[n_pixels:,n_pixels:]),comp_b)
-        # mult_mean = 1/(mult_var * np.dot(np.dot(comp_b,comb_param_Vinv[n_pixels:,n_pixels:]),true_b))
-        # # print(mult_mean,mult_var**0.5)
+        # #measure best single mult to b to get good agreement
+        use_b_inds = np.where(b_vect_means[non_max_inds] > min_b_val)[0]
+        if len(use_b_inds) >= 1:
+            true_b = true_b_vect[non_max_inds][use_b_inds]
+            comp_b = b_vect_means[non_max_inds][use_b_inds]
+            comp_Vinv = comb_param_Vinv[n_pixels:,n_pixels:][use_b_inds][:,use_b_inds]
+            mult_var = 1/np.dot(np.dot(comp_b,comp_Vinv),comp_b)
+            mult_mean = 1/(mult_var * np.dot(np.dot(comp_b,comp_Vinv),true_b))
+        else:
+            true_b = true_b_vect[non_max_inds]
+            comp_b = b_vect_means[non_max_inds]
+            mult_var = 1/np.dot(np.dot(comp_b,comb_param_Vinv[n_pixels:,n_pixels:]),comp_b)
+            mult_mean = 1/(mult_var * np.dot(np.dot(comp_b,comb_param_Vinv[n_pixels:,n_pixels:]),true_b))
+        # print(mult_mean,mult_var**0.5)
 
-        # #measure best single mult to f to get good agreement
-        mult_var = 1/np.dot(np.dot(f_max_means,comb_param_Vinv[:n_pixels,:n_pixels]),f_max_means)
-        mult_mean = mult_var * np.dot(np.dot(f_max_means,comb_param_Vinv[:n_pixels,:n_pixels]),true_fluxes)
+        # # #measure best single mult to f to get good agreement
+        # use_flux_inds = np.where(f_max_means > min_f_val)[0]
+        # if len(use_flux_inds) >= 1:
+        #     mult_var = 1/np.dot(np.dot(f_max_means[use_flux_inds],
+        #                                comb_param_Vinv[:n_pixels,:n_pixels][use_flux_inds][:,use_flux_inds]),
+        #                         f_max_means[use_flux_inds])
+        #     mult_mean = mult_var * np.dot(np.dot(f_max_means[use_flux_inds],
+        #                                          comb_param_Vinv[:n_pixels,:n_pixels][use_flux_inds][:,use_flux_inds]),
+        #                                   true_fluxes[use_flux_inds])
+        # else:
+        #     mult_var = 1/np.dot(np.dot(curr_f_max,comb_param_Vinv[:n_pixels,:n_pixels]),curr_f_max)
+        #     mult_mean = mult_var * np.dot(np.dot(curr_f_max,comb_param_Vinv[:n_pixels,:n_pixels]),true_fluxes)
         
         #then rescale the fluxes and b values
         f_max_means *= mult_mean
@@ -537,10 +701,10 @@ def measure_time_dep_fluxes_GIBBS(obs_fluxes,read_errs,
         comb_param_samps[:,n_pixels:] /= mult_mean
 
         comb_param_V = np.linalg.inv(comb_param_Vinv)
-        comb_param_V[:n_pixels] *= mult_mean**2
-        comb_param_V[:,:n_pixels] *= mult_mean**2
-        comb_param_V[n_pixels:] /= mult_mean**2
-        comb_param_V[:,n_pixels:] /= mult_mean**2
+        comb_param_V[:n_pixels] *= mult_mean
+        comb_param_V[:,:n_pixels] *= mult_mean
+        comb_param_V[n_pixels:] /= mult_mean
+        comb_param_V[:,n_pixels:] /= mult_mean
 
         comb_param_Vinv = np.linalg.inv(comb_param_V)
             
@@ -567,8 +731,9 @@ def measure_time_dep_fluxes_GIBBS(obs_fluxes,read_errs,
         curr_b_Vinv[non_max_inds[j],non_max_inds] = comb_param_Vinv[n_pixels+j,n_pixels:]
     curr_b_Vinv[max_b_ind] = 0
     curr_b_Vinv[:,max_b_ind] = 0
-    curr_b_V[max_b_ind] = np.inf
-    curr_b_V[:,max_b_ind] = np.inf
+    curr_b_V[max_b_ind] = 0
+    curr_b_V[:,max_b_ind] = 0
+    curr_b_V[max_b_ind,max_b_ind] = np.inf
 
     if return_samples:
         return max_b_ind,b_vect_means,curr_b_Vinv,curr_b_V,\
